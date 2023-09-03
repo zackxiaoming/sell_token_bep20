@@ -1,1 +1,175 @@
-https://bsc-dataseed.bnbchain.org
+// How to run
+// 1. install dependencies: npm install ethers
+// 2. run: node example.js
+
+var this_priv_key = process.argv[2];
+var this_contract = process.argv[3];
+var this_amount = process.argv[4];
+
+
+const { ethers } = require("ethers");
+
+const RPC_ENDPOINT = "https://bsc-dataseed.bnbchain.org";
+const PRIVATE_KEY = this_priv_key;
+
+const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+const PANCAKE_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"; // router address of pancakeswap
+const SELL_TOKEN = this_contract // what token to sell
+const SELL_AMOUNT = this_amount // how many to sell (e.g. 0.1 bnb)
+const slippage = 0.025 // slippage 40%
+
+const provider = new ethers.providers.JsonRpcProvider(RPC_ENDPOINT);
+
+const sellTokenWithTokenAmount = async (tokenAmount, tokenAddress, account, routerAddress) => {
+    const router = new ethers.Contract(
+        routerAddress,
+        [
+            "function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)",
+            "function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)",
+        ],
+        account
+    );
+
+    const tokenBalance = await getBalanceToken(tokenAddress, account);
+
+    const tokenIn = tokenAddress;
+    const tokenOut = WBNB; // WBNB
+
+    let amountIn = ethers.utils.parseUnits(tokenAmount, await getDecimal(tokenIn));
+
+    if (tokenBalance.lt(amountIn)) {
+        amountIn = tokenBalance
+    }
+
+    const amounts = await router.getAmountsOut(amountIn.toString(), [tokenIn, tokenOut]);
+    const amountOutMin = amounts[1].sub(amounts[1].div(1 / slippage))
+
+    const allowance = await getAllowance(tokenIn, account, routerAddress);
+
+    if (allowance.lt(amountIn)) {
+        await setAllowance(tokenIn, account, routerAddress, amountIn);
+    }
+
+    await sellTokenWithBNB(tokenIn, amountIn, tokenOut, amountOutMin, account, router);
+}
+
+const sellTokenWithBNBAmount = async (bnbAmount, tokenAddress, account, routerAddress) => {
+    const router = new ethers.Contract(
+        routerAddress,
+        [
+            "function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts)",
+            "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
+            "function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)",
+        ],
+        account
+    );
+    const tokenBalance = await getBalanceToken(tokenAddress, account);
+
+    const tokenIn = tokenAddress;
+    const tokenOut = WBNB; // WBNB
+
+    let amountOut = ethers.utils.parseEther(bnbAmount);
+    const amounts = await router.getAmountsIn(amountOut.toString(), [tokenIn, tokenOut]);
+    let amountInMin = amounts[0].add(amounts[0].div(1 / slippage));
+
+    if (tokenBalance.lt(amountInMin)) {
+        amountInMin = tokenBalance;
+        const amounts = await router.getAmountsOut(amountInMin.toString(), [tokenIn, tokenOut]);
+        amountOut = amounts[1].sub(amounts[1].div(1 / slippage))
+    }
+
+    const allowance = await getAllowance(tokenIn, account, routerAddress);
+
+    if (allowance.lt(amountInMin)) {
+        await setAllowance(tokenIn, account, routerAddress, amountInMin);
+    }
+
+    await sellTokenWithBNB(tokenIn, amountInMin, tokenOut, amountOut, account, router);
+}
+
+const sellTokenWithBNB = async (tokenIn, tokenInAmount, tokenOut, tokenOutAmount, account, router) => {
+    const tx = await router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+        tokenInAmount.toString(),
+        tokenOutAmount.toString(),
+        [tokenIn, tokenOut],
+        account.address,
+        Date.now() + 1000 * 60 * 10, // this txn will be reverted after 10 minutes if not successed
+        {
+            gasLimit: "300000",
+            gasPrice: await provider.getGasPrice(),
+        }
+    );
+
+    const receipt = await tx.wait();
+    //console.log("Transaction Hash ", receipt.transactionHash)
+
+    const PANCAKE_SWAP_TOPIC = ethers.utils.id("Swap(address,uint256,uint256,uint256,uint256,address)");
+    const PANCAKE_SWAP_EVENT = "event Swap (address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)";
+    const swapLogs = receipt.logs.filter(log => log.topics[0] === PANCAKE_SWAP_TOPIC);
+    const lastSwapEvent = swapLogs.slice(-1)[0];
+    const swapInterface = new ethers.utils.Interface([PANCAKE_SWAP_EVENT]);
+    const parsed = swapInterface.parseLog(lastSwapEvent);
+    const sendTokens = parsed.args.amount1In.isZero() ?  parsed.args.amount0In : parsed.args.amount1In;
+    const receivedTokens = parsed.args.amount0Out.isZero() ?  parsed.args.amount1Out : parsed.args.amount0Out;
+    //console.log("Sent Amount: ", ethers.utils.formatUnits(sendTokens, await getDecimal(tokenIn)).toString(),
+    //    "; Received Amount: ", ethers.utils.formatEther(receivedTokens).toString())
+
+    console.log(ethers.utils.formatUnits(sendTokens, await getDecimal(tokenIn)).toString()+"###"+ethers.utils.formatEther(receivedTokens).toString()+"###"+receipt.transactionHash);
+
+};
+
+const getBalanceToken = async (tokenAddress, account) => {
+    const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ["function balanceOf(address owner) external view returns (uint)"],
+        account
+    );
+    return (await tokenContract.balanceOf(account.address));
+};
+
+const getAllowance = async (tokenAddress, account, spender) => {
+    const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ["function allowance(address owner, address spender) external view returns (uint)"],
+        account
+    );
+    return (await tokenContract.allowance(account.address, spender));
+};
+
+const setAllowance = async (tokenAddress, account, spender, amount) => {
+    const tokenToApprove = new ethers.Contract(
+        tokenAddress,
+        ["function approve(address spender, uint amount) public returns(bool)"],
+        account,
+        {
+            gasLimit: "300000",
+            gasPrice: await provider.getGasPrice(),
+        }
+    );
+
+    const tx = await tokenToApprove.approve(spender, amount);
+    await tx.wait();
+};
+
+const getDecimal = async (tokenAddress) => {
+    const contract = new ethers.Contract(
+        tokenAddress,
+        [
+            "function decimals() view returns (uint256)"
+        ]
+        ,provider
+    );
+    try {
+        return await contract.decimals();
+    } catch (e) {
+        return 18;
+    }
+}
+
+(async () => {
+    const account = new ethers.Wallet(PRIVATE_KEY, provider);
+    //console.log("public key: ", account.address);
+
+    await sellTokenWithBNBAmount(SELL_AMOUNT, SELL_TOKEN, account, PANCAKE_ROUTER);
+    // await sellTokenWithTokenAmount(SELL_AMOUNT, SELL_TOKEN, account, PANCAKE_ROUTER);
+})()
